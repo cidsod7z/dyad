@@ -1,395 +1,269 @@
-# VERY IMPORTANT:
-# This workflow has elevated permissions (contents:write, pull-requests:write).
-# It should ONLY run on trusted maintainers code (e.g. wwwillchen).
-# Author allowlists are enforced in the job steps below.
 name: PR Review Responder
-
-on:
+'on':
   pull_request_target:
-    types: [labeled]
+    types:
+    - labeled
   workflow_run:
-    workflows: ["CI"]
-    # Regardless of success or fail, we want to run this workflow.
-    # Why?
-    # If it's failure, we want to fix the errors.
-    # If it's success, we want to address the PR review comments from the AI code reviewers.
-    #
-    # The CI workflow is almost always the last workflow to finish, so that's why we wait for it.
-    types: [completed]
-
-# Restrict default permissions; the job below declares only what it needs.
+    workflows:
+    - CI
+    types:
+    - completed
 permissions: {}
-
 jobs:
   respond-to-pr:
-    if: >-
-      github.event_name == 'workflow_run' ||
-      (github.event_name == 'pull_request_target' && github.event.label.name == 'cc:request:now')
+    if: github.event_name == 'workflow_run' || (github.event_name == 'pull_request_target'
+      && github.event.label.name == 'cc:request:now')
     environment: ai-bots
-    runs-on:
-      - self-hosted
-      - macOS
-      - ARM64
+    runs-on: macos-latest
     permissions:
-      contents: write # push commits to PR branches
-      pull-requests: write # edit labels, post comments
+      contents: write
+      pull-requests: write
     steps:
-      - name: Create GitHub App token for base repo
-        id: base-app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.DYAD_GITHUB_APP_ID }}
-          private-key: ${{ secrets.DYAD_GITHUB_APP_PRIVATE_KEY }}
-          permission-actions: write
-          permission-contents: write
-          permission-pull-requests: write
-          permission-workflows: write
+    - name: Create GitHub App token for base repo
+      id: base-app-token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ vars.DYAD_GITHUB_APP_ID }}
+        private-key: ${{ secrets.DYAD_GITHUB_APP_PRIVATE_KEY }}
+        permission-actions: write
+        permission-contents: write
+        permission-pull-requests: write
+        permission-workflows: write
+    - name: Get PR info and check labels
+      id: pr-info
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ steps.base-app-token.outputs.token }}
+        script: "const eventName = context.eventName;\nlet prNumber, headRepo, headBranch,\
+          \ prLabels, prAuthor;\n\nif (eventName === 'pull_request_target') {\n  //\
+          \ Triggered by adding cc:request:now label\n  const pr = context.payload.pull_request;\n\
+          \  prNumber = pr.number;\n  headRepo = pr.head.repo ? pr.head.repo.full_name\
+          \ : null;\n  headBranch = pr.head.ref;\n  prLabels = pr.labels;\n  prAuthor\
+          \ = pr.user.login;\n\n  // Check that the person who applied the label is\
+          \ a trusted actor\n  const actor = context.actor;\n  const allowedActors\
+          \ = ['wwwillchen', 'keppo-bot', 'keppo-bot[bot]', 'dyad-assistant'];\n \
+          \ if (!allowedActors.includes(actor)) {\n    console.log(`Label applied\
+          \ by ${actor} who is not in the allowed actors list`);\n    core.setOutput('should_continue',\
+          \ 'false');\n    return;\n  }\n\n  if (!headRepo) {\n    console.log('Head\
+          \ repository not available');\n    core.setOutput('should_continue', 'false');\n\
+          \    return;\n  }\n} else {\n  // workflow_run event\n  const run = context.payload.workflow_run;\n\
+          \n  // Get PR associated with this workflow run\n  // Note: run.pull_requests\
+          \ can be empty for cross-repo PRs (forks)\n  // So we also search by head\
+          \ SHA as a fallback\n  if (run.pull_requests && run.pull_requests.length\
+          \ > 0) {\n    prNumber = run.pull_requests[0].number;\n  } else {\n    //\
+          \ Search for PRs with matching head branch\n    // Note: head_repository\
+          \ can be null if the fork was deleted\n    if (!run.head_repository) {\n\
+          \      console.log('Head repository not available');\n      core.setOutput('should_continue',\
+          \ 'false');\n      return;\n    }\n    const { data: prs } = await github.rest.pulls.list({\n\
+          \      owner: context.repo.owner,\n      repo: context.repo.repo,\n    \
+          \  state: 'open',\n      head: `${run.head_repository.owner.login}:${run.head_branch}`\n\
+          \    });\n\n    if (prs.length === 0) {\n      console.log('No pull requests\
+          \ found for this workflow run');\n      core.setOutput('should_continue',\
+          \ 'false');\n      return;\n    }\n    prNumber = prs[0].number;\n  }\n\n\
+          \  if (!run.head_repository) {\n    console.log('Head repository not available\
+          \ (fork may have been deleted)');\n    core.setOutput('should_continue',\
+          \ 'false');\n    return;\n  }\n\n  headRepo = run.head_repository.full_name;\n\
+          \  headBranch = run.head_branch;\n\n  // Fetch full PR details to get labels\
+          \ and author\n  const { data: pr } = await github.rest.pulls.get({\n   \
+          \ owner: context.repo.owner,\n    repo: context.repo.repo,\n    pull_number:\
+          \ prNumber\n  });\n  prLabels = pr.labels;\n  prAuthor = pr.user.login;\n\
+          }\n\nconst allowedAuthors = ['wwwillchen', 'keppo-bot', 'keppo-bot[bot]',\
+          \ 'dyad-assistant', 'princeaden1'];\nif (!allowedAuthors.includes(prAuthor))\
+          \ {\n  console.log(`PR #${prNumber} author ${prAuthor} is not allowed to\
+          \ use this workflow`);\n  core.setOutput('should_continue', 'false');\n\
+          \  return;\n}\n\n// Check for cc:request, cc:request:now (initial) or cc:request:N\
+          \ (re-request) labels\n// If multiple labels exist, use the highest count\
+          \ to avoid resetting the retry counter\nlet requestCount = -1;\nlet currentLabel\
+          \ = '';\n\nfor (const label of prLabels) {\n  if (label.name === 'cc:request'\
+          \ || (label.name === 'cc:request:now' && eventName === 'pull_request_target'))\
+          \ {\n    if (requestCount < 0) {\n      requestCount = 0;\n      currentLabel\
+          \ = label.name;\n    }\n  }\n  const match = label.name.match(/^cc:request:(\\\
+          d+)$/);\n  if (match) {\n    const count = parseInt(match[1], 10);\n   \
+          \ if (count > requestCount) {\n      requestCount = count;\n      currentLabel\
+          \ = label.name;\n    }\n  }\n}\n\nif (requestCount === -1) {\n  console.log(`PR\
+          \ #${prNumber} does not have a cc:request, cc:request:now, or cc:request:N\
+          \ label`);\n  core.setOutput('should_continue', 'false');\n  return;\n}\n\
+          \n// Guard: do not loop more than 3 retries (4 total runs: initial + 3 retries)\n\
+          // cc:request (0) -> cc:request:1 (1) -> cc:request:2 (2) -> cc:request:3\
+          \ (3) -> blocked\nif (requestCount >= 4) {\n  console.log(`PR #${prNumber}\
+          \ has reached max retry count (${requestCount}), adding needs-human:review-issue`);\n\
+          \n  // Remove current label, cc:pending\n  await github.rest.issues.removeLabel({\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    issue_number:\
+          \ prNumber,\n    name: currentLabel\n  }).catch(() => {});\n\n  await github.rest.issues.removeLabel({\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    issue_number:\
+          \ prNumber,\n    name: 'cc:pending'\n  }).catch(() => {});\n\n  // Also\
+          \ add needs-human:review-issue (retries exhausted = needs human attention).\n\
+          \  await github.rest.issues.addLabels({\n    owner: context.repo.owner,\n\
+          \    repo: context.repo.repo,\n    issue_number: prNumber,\n    labels:\
+          \ ['needs-human:review-issue']\n  });\n\n  await github.rest.issues.removeLabel({\n\
+          \    owner: context.repo.owner,\n    repo: context.repo.repo,\n    issue_number:\
+          \ prNumber,\n    name: 'needs-human:final-check'\n  }).catch(() => {});\n\
+          \n  core.setOutput('pr_number', prNumber);\n  core.setOutput('should_continue',\
+          \ 'false');\n  return;\n}\n\nconsole.log(`PR #${prNumber} has ${currentLabel}\
+          \ label (count=${requestCount}), proceeding with pr-fix`);\ncore.setOutput('pr_number',\
+          \ prNumber);\ncore.setOutput('should_continue', 'true');\ncore.setOutput('request_count',\
+          \ requestCount);\ncore.setOutput('current_label', currentLabel);\ncore.setOutput('head_repo',\
+          \ headRepo);\ncore.setOutput('head_branch', headBranch);\n// ci_conclusion\
+          \ is only available for workflow_run events\ncore.setOutput('ci_conclusion',\
+          \ eventName === 'workflow_run'\n  ? context.payload.workflow_run.conclusion\n\
+          \  : '');\n"
+    - name: Create GitHub App token for PR head repo
+      if: steps.pr-info.outputs.should_continue == 'true'
+      id: head-app-token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ vars.DYAD_GITHUB_APP_ID }}
+        private-key: ${{ secrets.DYAD_GITHUB_APP_PRIVATE_KEY }}
+        owner: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.owner.login
+          || github.event.workflow_run.head_repository.owner.login }}
+        repositories: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.name
+          || github.event.workflow_run.head_repository.name }}
+        permission-contents: write
+        permission-workflows: write
+    - name: Checkout repository
+      if: steps.pr-info.outputs.should_continue == 'true'
+      uses: actions/checkout@v5
+      with:
+        repository: ${{ steps.pr-info.outputs.head_repo }}
+        ref: ${{ steps.pr-info.outputs.head_branch }}
+        fetch-depth: 0
+    - name: Record HEAD before Claude Code
+      if: steps.pr-info.outputs.should_continue == 'true'
+      id: before-claude
+      run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+    - name: Configure push remote for fork PRs
+      if: steps.pr-info.outputs.should_continue == 'true'
+      run: '# claude-code-action overwrites origin''s fetch URL to point to dyad-sh/dyad
 
-      - name: Get PR info and check labels
-        id: pr-info
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ steps.base-app-token.outputs.token }}
-          script: |
-            const eventName = context.eventName;
-            let prNumber, headRepo, headBranch, prLabels, prAuthor;
+        # (using GITHUB_REPOSITORY which is always the base repo in workflow_run events).
 
-            if (eventName === 'pull_request_target') {
-              // Triggered by adding cc:request:now label
-              const pr = context.payload.pull_request;
-              prNumber = pr.number;
-              headRepo = pr.head.repo ? pr.head.repo.full_name : null;
-              headBranch = pr.head.ref;
-              prLabels = pr.labels;
-              prAuthor = pr.user.login;
+        # Setting pushurl separately ensures git push still targets the fork,
 
-              // Check that the person who applied the label is a trusted actor
-              const actor = context.actor;
-              const allowedActors = ['wwwillchen', 'keppo-bot', 'keppo-bot[bot]', 'dyad-assistant'];
-              if (!allowedActors.includes(actor)) {
-                console.log(`Label applied by ${actor} who is not in the allowed actors list`);
-                core.setOutput('should_continue', 'false');
-                return;
-              }
+        # because git uses pushurl over url when both are configured.
 
-              if (!headRepo) {
-                console.log('Head repository not available');
-                core.setOutput('should_continue', 'false');
-                return;
-              }
-            } else {
-              // workflow_run event
-              const run = context.payload.workflow_run;
+        #
 
-              // Get PR associated with this workflow run
-              // Note: run.pull_requests can be empty for cross-repo PRs (forks)
-              // So we also search by head SHA as a fallback
-              if (run.pull_requests && run.pull_requests.length > 0) {
-                prNumber = run.pull_requests[0].number;
-              } else {
-                // Search for PRs with matching head branch
-                // Note: head_repository can be null if the fork was deleted
-                if (!run.head_repository) {
-                  console.log('Head repository not available');
-                  core.setOutput('should_continue', 'false');
-                  return;
-                }
-                const { data: prs } = await github.rest.pulls.list({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  state: 'open',
-                  head: `${run.head_repository.owner.login}:${run.head_branch}`
-                });
+        # We use a GitHub App token instead of GITHUB_TOKEN so that
 
-                if (prs.length === 0) {
-                  console.log('No pull requests found for this workflow run');
-                  core.setOutput('should_continue', 'false');
-                  return;
-                }
-                prNumber = prs[0].number;
-              }
+        # the push creates real PR events (synchronize) that trigger downstream workflows
 
-              if (!run.head_repository) {
-                console.log('Head repository not available (fork may have been deleted)');
-                core.setOutput('should_continue', 'false');
-                return;
-              }
+        # like CI. Pushes made with GITHUB_TOKEN are silently ignored by GitHub to
+        prevent
 
-              headRepo = run.head_repository.full_name;
-              headBranch = run.head_branch;
+        # infinite loops.
 
-              // Fetch full PR details to get labels and author
-              const { data: pr } = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber
-              });
-              prLabels = pr.labels;
-              prAuthor = pr.user.login;
-            }
+        git remote set-url --push origin "https://x-access-token:${PR_HEAD_APP_TOKEN}@github.com/${{
+        steps.pr-info.outputs.head_repo }}.git"
 
-            const allowedAuthors = ['wwwillchen', 'keppo-bot', 'keppo-bot[bot]', 'dyad-assistant', 'princeaden1'];
-            if (!allowedAuthors.includes(prAuthor)) {
-              console.log(`PR #${prNumber} author ${prAuthor} is not allowed to use this workflow`);
-              core.setOutput('should_continue', 'false');
-              return;
-            }
+        echo "Configured pushurl to ${{ steps.pr-info.outputs.head_repo }}"
 
-            // Check for cc:request, cc:request:now (initial) or cc:request:N (re-request) labels
-            // If multiple labels exist, use the highest count to avoid resetting the retry counter
-            let requestCount = -1;
-            let currentLabel = '';
+        '
+      env:
+        PR_HEAD_APP_TOKEN: ${{ steps.head-app-token.outputs.token }}
+    - name: Ensure Homebrew paths are available
+      if: steps.pr-info.outputs.should_continue == 'true'
+      run: '# Self-hosted macOS runners often have gh installed via Homebrew, but
 
-            for (const label of prLabels) {
-              if (label.name === 'cc:request' || (label.name === 'cc:request:now' && eventName === 'pull_request_target')) {
-                if (requestCount < 0) {
-                  requestCount = 0;
-                  currentLabel = label.name;
-                }
-              }
-              const match = label.name.match(/^cc:request:(\d+)$/);
-              if (match) {
-                const count = parseInt(match[1], 10);
-                if (count > requestCount) {
-                  requestCount = count;
-                  currentLabel = label.name;
-                }
-              }
-            }
+        # non-interactive shells may not include Homebrew directories in PATH.
 
-            if (requestCount === -1) {
-              console.log(`PR #${prNumber} does not have a cc:request, cc:request:now, or cc:request:N label`);
-              core.setOutput('should_continue', 'false');
-              return;
-            }
+        echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
 
-            // Guard: do not loop more than 3 retries (4 total runs: initial + 3 retries)
-            // cc:request (0) -> cc:request:1 (1) -> cc:request:2 (2) -> cc:request:3 (3) -> blocked
-            if (requestCount >= 4) {
-              console.log(`PR #${prNumber} has reached max retry count (${requestCount}), adding needs-human:review-issue`);
+        echo "/usr/local/bin" >> "$GITHUB_PATH"
 
-              // Remove current label, cc:pending
-              await github.rest.issues.removeLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                name: currentLabel
-              }).catch(() => {});
+        '
+    - name: Update labels to pending
+      if: steps.pr-info.outputs.should_continue == 'true'
+      run: 'gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository
+        }} --remove-label "${{ steps.pr-info.outputs.current_label }}" --add-label
+        "cc:pending"
 
-              await github.rest.issues.removeLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                name: 'cc:pending'
-              }).catch(() => {});
+        '
+      env:
+        GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
+    - name: Run PR Fix
+      if: steps.pr-info.outputs.should_continue == 'true'
+      uses: anthropics/claude-code-action@v1.0.96
+      with:
+        claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        github_token: ${{ steps.base-app-token.outputs.token }}
+        claude_args: --model claude-opus-4-6
+        display_report: true
+        prompt: 'Run the following skill end-to-end. Execute every step sequentially.
+          Do not skip, summarize, or stop early.
 
-              // Also add needs-human:review-issue (retries exhausted = needs human attention).
-              await github.rest.issues.addLabels({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                labels: ['needs-human:review-issue']
-              });
 
-              await github.rest.issues.removeLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: prNumber,
-                name: 'needs-human:final-check'
-              }).catch(() => {});
+          /dyad:pr-fix ${{ steps.pr-info.outputs.pr_number }}
 
-              core.setOutput('pr_number', prNumber);
-              core.setOutput('should_continue', 'false');
-              return;
-            }
+          '
+    - name: Push any unpushed changes
+      if: steps.pr-info.outputs.should_continue == 'true' && always()
+      run: "if [ \"$(git rev-list --count @{u}..HEAD 2>/dev/null || echo '0')\" -gt\
+        \ 0 ]; then\n  echo \"Local branch is ahead of upstream, pushing...\"\n  git\
+        \ push --force-with-lease\nelse\n  echo \"No unpushed commits\"\nfi\n"
+    - name: Check if commits were pushed
+      if: steps.pr-info.outputs.should_continue == 'true' && always()
+      id: retrigger
+      env:
+        GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
+      run: "# Use the GitHub API to get the current head SHA, avoiding race conditions\
+        \ with git fetch\nPR_HEAD_SHA=$(gh pr view ${{ steps.pr-info.outputs.pr_number\
+        \ }} --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid')\n\
+        if [ -z \"$PR_HEAD_SHA\" ]; then\n  echo \"Failed to get PR head SHA, falling\
+        \ back to git fetch\"\n  git fetch origin ${{ steps.pr-info.outputs.head_branch\
+        \ }} || git fetch origin\n  PR_HEAD_SHA=$(git rev-parse FETCH_HEAD 2>/dev/null\
+        \ || git rev-parse origin/${{ steps.pr-info.outputs.head_branch }})\nfi\n\n\
+        if [ \"${{ steps.before-claude.outputs.sha }}\" != \"$PR_HEAD_SHA\" ]; then\n\
+        \  echo \"Claude pushed new commits (before: ${{ steps.before-claude.outputs.sha\
+        \ }}, after: $PR_HEAD_SHA)\"\n  echo \"commits_pushed=true\" >> $GITHUB_OUTPUT\n\
+        else\n  echo \"No new commits pushed\"\n  echo \"commits_pushed=false\" >>\
+        \ $GITHUB_OUTPUT\nfi\n"
+    - name: Update labels - re-request review (commits pushed)
+      if: steps.pr-info.outputs.should_continue == 'true' && always() && steps.retrigger.outputs.commits_pushed
+        == 'true'
+      run: "MAX_RETRIES=3\nREQUEST_COUNT=\"${{ steps.pr-info.outputs.request_count\
+        \ }}\"\nif [ \"${REQUEST_COUNT:-0}\" -ge \"$MAX_RETRIES\" ]; then\n  echo\
+        \ \"Max retries reached (${REQUEST_COUNT}/${MAX_RETRIES}), marking PR as failed\
+        \ for human review\"\n  gh pr edit ${{ steps.pr-info.outputs.pr_number }}\
+        \ --repo ${{ github.repository }} --remove-label \"cc:pending\" --add-label\
+        \ \"cc:failed\" --add-label \"needs-human:review-issue\"\nelse\n  NEXT_COUNT=$((\
+        \ ${REQUEST_COUNT:-0} + 1 ))\n  echo \"Setting cc:request:${NEXT_COUNT} to\
+        \ auto-re-request review (retry ${NEXT_COUNT} of ${MAX_RETRIES})\"\n  gh pr\
+        \ edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository\
+        \ }} --remove-label \"cc:pending\" --add-label \"cc:request:${NEXT_COUNT}\"\
+        \nfi\n"
+      env:
+        GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
+    - name: Update labels to done (no new commits)
+      if: steps.pr-info.outputs.should_continue == 'true' && success() && steps.retrigger.outputs.commits_pushed
+        == 'false'
+      run: 'gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository
+        }} --remove-label "cc:pending" --add-label "cc:done"
 
-            console.log(`PR #${prNumber} has ${currentLabel} label (count=${requestCount}), proceeding with pr-fix`);
-            core.setOutput('pr_number', prNumber);
-            core.setOutput('should_continue', 'true');
-            core.setOutput('request_count', requestCount);
-            core.setOutput('current_label', currentLabel);
-            core.setOutput('head_repo', headRepo);
-            core.setOutput('head_branch', headBranch);
-            // ci_conclusion is only available for workflow_run events
-            core.setOutput('ci_conclusion', eventName === 'workflow_run'
-              ? context.payload.workflow_run.conclusion
-              : '');
+        '
+      env:
+        GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
+    - name: Update labels to failed
+      if: steps.pr-info.outputs.should_continue == 'true' && failure()
+      run: 'gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository
+        }} --remove-label "cc:pending" --add-label "cc:failed"
 
-      - name: Create GitHub App token for PR head repo
-        if: steps.pr-info.outputs.should_continue == 'true'
-        id: head-app-token
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ vars.DYAD_GITHUB_APP_ID }}
-          private-key: ${{ secrets.DYAD_GITHUB_APP_PRIVATE_KEY }}
-          owner: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.owner.login || github.event.workflow_run.head_repository.owner.login }}
-          repositories: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.name || github.event.workflow_run.head_repository.name }}
-          permission-contents: write
-          permission-workflows: write
-
-      - name: Checkout repository
-        if: steps.pr-info.outputs.should_continue == 'true'
-        uses: actions/checkout@v5
-        with:
-          # Security note: The pr.user.login check verifies who opened the PR, but this
-          # checks out code from whoever last pushed. If "Allow edits from maintainers" is
-          # enabled, other maintainers could push to the branch. This is acceptable because
-          # maintainers already have write access to the repo and are trusted.
-          repository: ${{ steps.pr-info.outputs.head_repo }}
-          ref: ${{ steps.pr-info.outputs.head_branch }}
-          fetch-depth: 0
-
-      - name: Record HEAD before Claude Code
-        if: steps.pr-info.outputs.should_continue == 'true'
-        id: before-claude
-        run: echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
-
-      - name: Configure push remote for fork PRs
-        if: steps.pr-info.outputs.should_continue == 'true'
-        run: |
-          # claude-code-action overwrites origin's fetch URL to point to dyad-sh/dyad
-          # (using GITHUB_REPOSITORY which is always the base repo in workflow_run events).
-          # Setting pushurl separately ensures git push still targets the fork,
-          # because git uses pushurl over url when both are configured.
-          #
-          # We use a GitHub App token instead of GITHUB_TOKEN so that
-          # the push creates real PR events (synchronize) that trigger downstream workflows
-          # like CI. Pushes made with GITHUB_TOKEN are silently ignored by GitHub to prevent
-          # infinite loops.
-          git remote set-url --push origin "https://x-access-token:${PR_HEAD_APP_TOKEN}@github.com/${{ steps.pr-info.outputs.head_repo }}.git"
-          echo "Configured pushurl to ${{ steps.pr-info.outputs.head_repo }}"
-        env:
-          PR_HEAD_APP_TOKEN: ${{ steps.head-app-token.outputs.token }}
-
-      - name: Ensure Homebrew paths are available
-        if: steps.pr-info.outputs.should_continue == 'true'
-        run: |
-          # Self-hosted macOS runners often have gh installed via Homebrew, but
-          # non-interactive shells may not include Homebrew directories in PATH.
-          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
-          echo "/usr/local/bin" >> "$GITHUB_PATH"
-
-      - name: Update labels to pending
-        if: steps.pr-info.outputs.should_continue == 'true'
-        run: |
-          gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --remove-label "${{ steps.pr-info.outputs.current_label }}" --add-label "cc:pending"
-        env:
-          GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
-
-      - name: Run PR Fix
-        if: steps.pr-info.outputs.should_continue == 'true'
-        uses: anthropics/claude-code-action@v1.0.96
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ steps.base-app-token.outputs.token }}
-          claude_args: --model claude-opus-4-6
-          display_report: true
-          prompt: |
-            Run the following skill end-to-end. Execute every step sequentially. Do not skip, summarize, or stop early.
-
-            /dyad:pr-fix ${{ steps.pr-info.outputs.pr_number }}
-
-      - name: Push any unpushed changes
-        # In case the previous step accidentally forgot to push its changes
-        if: steps.pr-info.outputs.should_continue == 'true' && always()
-        run: |
-          if [ "$(git rev-list --count @{u}..HEAD 2>/dev/null || echo '0')" -gt 0 ]; then
-            echo "Local branch is ahead of upstream, pushing..."
-            git push --force-with-lease
-          else
-            echo "No unpushed commits"
-          fi
-
-      - name: Check if commits were pushed
-        # Use always() to ensure we detect commits even if Claude Code fails partway through.
-        # The push itself (made with the GitHub App token) triggers downstream workflows
-        # like CI, BugBot, and Claude PR Review naturally via pull_request synchronize events.
-        if: steps.pr-info.outputs.should_continue == 'true' && always()
-        id: retrigger
-        env:
-          GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
-        run: |
-          # Use the GitHub API to get the current head SHA, avoiding race conditions with git fetch
-          PR_HEAD_SHA=$(gh pr view ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --json headRefOid --jq '.headRefOid')
-          if [ -z "$PR_HEAD_SHA" ]; then
-            echo "Failed to get PR head SHA, falling back to git fetch"
-            git fetch origin ${{ steps.pr-info.outputs.head_branch }} || git fetch origin
-            PR_HEAD_SHA=$(git rev-parse FETCH_HEAD 2>/dev/null || git rev-parse origin/${{ steps.pr-info.outputs.head_branch }})
-          fi
-
-          if [ "${{ steps.before-claude.outputs.sha }}" != "$PR_HEAD_SHA" ]; then
-            echo "Claude pushed new commits (before: ${{ steps.before-claude.outputs.sha }}, after: $PR_HEAD_SHA)"
-            echo "commits_pushed=true" >> $GITHUB_OUTPUT
-          else
-            echo "No new commits pushed"
-            echo "commits_pushed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Update labels - re-request review (commits pushed)
-        # Use always() so retry loop continues even if Claude Code fails after pushing commits
-        if: steps.pr-info.outputs.should_continue == 'true' && always() && steps.retrigger.outputs.commits_pushed == 'true'
-        run: |
-          MAX_RETRIES=3
-          REQUEST_COUNT="${{ steps.pr-info.outputs.request_count }}"
-          if [ "${REQUEST_COUNT:-0}" -ge "$MAX_RETRIES" ]; then
-            echo "Max retries reached (${REQUEST_COUNT}/${MAX_RETRIES}), marking PR as failed for human review"
-            gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --remove-label "cc:pending" --add-label "cc:failed" --add-label "needs-human:review-issue"
-          else
-            NEXT_COUNT=$(( ${REQUEST_COUNT:-0} + 1 ))
-            echo "Setting cc:request:${NEXT_COUNT} to auto-re-request review (retry ${NEXT_COUNT} of ${MAX_RETRIES})"
-            gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --remove-label "cc:pending" --add-label "cc:request:${NEXT_COUNT}"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
-
-      - name: Update labels to done (no new commits)
-        if: steps.pr-info.outputs.should_continue == 'true' && success() && steps.retrigger.outputs.commits_pushed == 'false'
-        run: |
-          gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --remove-label "cc:pending" --add-label "cc:done"
-        env:
-          GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
-
-      - name: Update labels to failed
-        if: steps.pr-info.outputs.should_continue == 'true' && failure()
-        run: |
-          gh pr edit ${{ steps.pr-info.outputs.pr_number }} --repo ${{ github.repository }} --remove-label "cc:pending" --add-label "cc:failed"
-        env:
-          GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
-
-      - name: Checkout base repo for labeler script
-        # The earlier checkout checks out the PR head repo, which for
-        # fork PRs may not contain scripts/pr-status-labeler.js. Checkout the
-        # base repo's default branch to a separate path so the script is always available.
-        # Only runs when ci_conclusion is available (workflow_run events).
-        if: >-
-          steps.pr-info.outputs.should_continue == 'true' &&
-          steps.pr-info.outputs.ci_conclusion != '' &&
-          always() &&
-          steps.retrigger.outputs.commits_pushed != 'true'
-        uses: actions/checkout@v5
-        with:
-          path: __base
-          sparse-checkout: scripts/pr-status-labeler.js
-
-      - name: Apply needs-human status label
-        # Run when PR reaches a terminal state (cc:done or cc:failed) but NOT when
-        # commits were pushed (retry loop continues). Uses always() to run even if
-        # the Claude Code step failed. Only runs when ci_conclusion is available
-        # (workflow_run events); cc:request:now triggers skip this since CI status is unknown.
-        if: >-
-          steps.pr-info.outputs.should_continue == 'true' &&
-          steps.pr-info.outputs.ci_conclusion != '' &&
-          always() &&
-          steps.retrigger.outputs.commits_pushed != 'true'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ steps.base-app-token.outputs.token }}
-          script: |
-            const { run } = require('./__base/scripts/pr-status-labeler.js');
-            await run({
-              github,
-              context,
-              core,
-              prNumber: parseInt('${{ steps.pr-info.outputs.pr_number }}', 10),
-              ciConclusion: '${{ steps.pr-info.outputs.ci_conclusion }}'
-            });
+        '
+      env:
+        GITHUB_TOKEN: ${{ steps.base-app-token.outputs.token }}
+    - name: Checkout base repo for labeler script
+      if: steps.pr-info.outputs.should_continue == 'true' && steps.pr-info.outputs.ci_conclusion
+        != '' && always() && steps.retrigger.outputs.commits_pushed != 'true'
+      uses: actions/checkout@v5
+      with:
+        path: __base
+        sparse-checkout: scripts/pr-status-labeler.js
+    - name: Apply needs-human status label
+      if: steps.pr-info.outputs.should_continue == 'true' && steps.pr-info.outputs.ci_conclusion
+        != '' && always() && steps.retrigger.outputs.commits_pushed != 'true'
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ steps.base-app-token.outputs.token }}
+        script: "const { run } = require('./__base/scripts/pr-status-labeler.js');\n\
+          await run({\n  github,\n  context,\n  core,\n  prNumber: parseInt('${{ steps.pr-info.outputs.pr_number\
+          \ }}', 10),\n  ciConclusion: '${{ steps.pr-info.outputs.ci_conclusion }}'\n\
+          });\n"
